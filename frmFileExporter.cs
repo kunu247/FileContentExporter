@@ -47,90 +47,34 @@ namespace FileContentExporter
         private string _rootPath;
         private bool _isCheckingProgrammatically;
         private List<string> _recentPaths = new List<string>();
-        private CheckedListBox clbExtensions;
         private GitIgnoreFilter _gitIgnore;
         private List<string> _filterPatterns = new List<string>(); // from txtFilter, e.g. *.cs;*.xaml
         private HashSet<string> _excludedExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        private ComboBox cmbRecentPaths;
-        private TextBox txtFilter;
         private int _lastFindIndex = 0;
+        private bool _isSyncingRecentPaths;    // true while we rebuild cmbRecentPaths ourselves
+        private bool _isRefreshingExtensions;  // true while we rebuild clbExtensions ourselves
+
+        // Look of the owner-drawn tooltips
+        private static readonly Font TipFont = new Font("Roboto", 9f);
+        private const TextFormatFlags TipFlags = TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.WordBreak | TextFormatFlags.NoPadding;
         #endregion
 
         public frmFileExporter()
         {
             InitializeComponent();
-            ApplyDraculaTheme();
-            SetupDragDrop();
-            SetupRecentPathsAndFilter();
-            SetupFindShortcut();
             RestoreSession();
             UpdateStatus();
         }
-        private void SetupRecentPathsAndFilter()
-        {
-            // Recent paths dropdown, placed under the path textbox in pnlTop.
-            cmbRecentPaths = new ComboBox
-            {
-                DropDownStyle = ComboBoxStyle.DropDownList,
-                Location = new Point(12, 52),
-                Width = 300,
-                BackColor = DraculaTheme.Background,
-                ForeColor = DraculaTheme.Foreground
-            };
-            cmbRecentPaths.SelectedIndexChanged += (s, e) =>
-            {
-                if (cmbRecentPaths.SelectedItem != null)
-                {
-                    txtPath.Text = cmbRecentPaths.SelectedItem.ToString();
-                    btnLoadTree_Click(s, EventArgs.Empty);
-                }
-            };
-            pnlTop.Controls.Add(cmbRecentPaths);
-
-            // Filter box, placed in the tree toolbar.
-            txtFilter = new TextBox
-            {
-                Dock = DockStyle.Right,
-                Width = 160,
-                BackColor = DraculaTheme.Background,
-                ForeColor = DraculaTheme.Foreground,
-                BorderStyle = BorderStyle.FixedSingle
-            };
-            // Simple placeholder behavior (no native PlaceholderText on .NET Framework TextBox).
-            txtFilter.Text = "*.cs;*.xaml";
-            txtFilter.ForeColor = DraculaTheme.Comment;
-            txtFilter.Enter += (s, e) =>
-            {
-                if (txtFilter.Text == "*.cs;*.xaml")
-                {
-                    txtFilter.Text = "";
-                    txtFilter.ForeColor = DraculaTheme.Foreground;
-                }
-            };
-            txtFilter.KeyDown += (s, e) =>
-            {
-                if (e.KeyCode == Keys.Enter)
-                {
-                    e.SuppressKeyPress = true;
-                    ApplyFilterAndReload();
-                }
-            };
-            pnlTreeToolbar.Controls.Add(txtFilter);
-
-            CreateExtensionChecklist();
-        }
-
         private void ApplyFilterAndReload()
         {
             _filterPatterns = string.IsNullOrWhiteSpace(txtFilter.Text) || txtFilter.Text == "*.cs;*.xaml"
                 ? new List<string>()
                 : txtFilter.Text.Split(';').Where(p => !string.IsNullOrWhiteSpace(p)).ToList();
 
+            UpdateFilterTip();
             if (string.IsNullOrEmpty(_rootPath)) return;
 
-            Cursor = Cursors.WaitCursor;
-            try { PopulateTree(_rootPath); }
-            finally { Cursor = Cursors.Default; }
+            ReloadTree("Applying filter…");
             RefreshExtensionChecklist();
         }
 
@@ -140,24 +84,16 @@ namespace FileContentExporter
             _recentPaths.Insert(0, path);
             if (_recentPaths.Count > 8) _recentPaths.RemoveRange(8, _recentPaths.Count - 8);
 
-            cmbRecentPaths.Items.Clear();
-            cmbRecentPaths.Items.AddRange(_recentPaths.ToArray());
-        }
-        private void SetupDragDrop()
-        {
-            AllowDrop = true;
-            DragEnter += (s, e) =>
-                e.Effect = e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None;
-
-            DragDrop += (s, e) =>
+            _isSyncingRecentPaths = true;   // Clear + reselect would otherwise re-enter the handler and reload again
+            try
             {
-                var paths = (string[])e.Data.GetData(DataFormats.FileDrop);
-                if (paths == null || paths.Length == 0) return;
+                cmbRecentPaths.Items.Clear();
+                cmbRecentPaths.Items.AddRange(_recentPaths.ToArray());
+                cmbRecentPaths.SelectedIndex = 0;   // show the folder that is actually loaded
+            }
+            finally { _isSyncingRecentPaths = false; }
 
-                string dropped = paths[0];
-                txtPath.Text = File.Exists(dropped) ? Path.GetDirectoryName(dropped) : dropped;
-                btnLoadTree_Click(s, EventArgs.Empty);
-            };
+            UpdateRecentPathsTip();
         }
         private void RestoreSession()
         {
@@ -167,80 +103,23 @@ namespace FileContentExporter
 
             if (!string.IsNullOrEmpty(AppSettings.LastRootPath) && Directory.Exists(AppSettings.LastRootPath))
                 txtPath.Text = AppSettings.LastRootPath; // populate only — user clicks Load Tree to restore
+
+            UpdateRecentPathsTip();
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             base.OnFormClosing(e);
 
-            var fileNodes = new List<TreeNode>();
-            CollectCheckedFileNodes(treeViewFiles.Nodes, fileNodes);
-            var checkedRelative = fileNodes
-                .Select(n => GetRelativePath(((FileSystemNodeInfo)n.Tag).FullPath))
-                .ToList();
+            if (string.IsNullOrEmpty(_rootPath))
+            {
+                // No folder was loaded this session: keep last session's data instead of overwriting it with blanks.
+                AppSettings.Save(AppSettings.LastRootPath, _recentPaths, AppSettings.LastCheckedRelativePaths);
+                return;
+            }
 
-            AppSettings.Save(_rootPath, _recentPaths, checkedRelative);
+            AppSettings.Save(_rootPath, _recentPaths, GetCheckedRelativePaths());
         }
-        // ---------- Theming ----------
-
-        private void ApplyDraculaTheme()
-        {
-            BackColor = DraculaTheme.Background;
-
-            // Top bar
-            pnlTop.BackColor = DraculaTheme.CurrentLine;
-            lblPath.ForeColor = DraculaTheme.Foreground;
-            chkExcludeCommon.ForeColor = DraculaTheme.Foreground;
-            chkExcludeCommon.BackColor = Color.Transparent;
-
-            txtPath.BackColor = DraculaTheme.Background;
-            txtPath.ForeColor = DraculaTheme.Foreground;
-            txtPath.BorderStyle = BorderStyle.FixedSingle;
-
-            StyleButton(btnBrowseFolder, DraculaTheme.Purple);
-            StyleButton(btnBrowseFile, DraculaTheme.Purple);
-            StyleButton(btnLoadTree, DraculaTheme.Green);
-
-            // Tree panel
-            pnlTreeToolbar.BackColor = DraculaTheme.CurrentLine;
-            treeViewFiles.BackColor = DraculaTheme.Background;
-            treeViewFiles.ForeColor = DraculaTheme.Foreground;
-            treeViewFiles.LineColor = DraculaTheme.Comment;
-            treeViewFiles.BorderStyle = BorderStyle.FixedSingle;
-
-            StyleButton(btnCheckAll, DraculaTheme.Green);
-            StyleButton(btnUncheckAll, DraculaTheme.Red);
-
-            // Output panel
-            pnlOutputToolbar.BackColor = DraculaTheme.CurrentLine;
-            txtOutput.BackColor = DraculaTheme.Background;
-            txtOutput.ForeColor = DraculaTheme.Foreground;
-            txtOutput.BorderStyle = BorderStyle.FixedSingle;
-
-            StyleButton(btnGenerate, DraculaTheme.Purple);
-            StyleButton(btnCopyAll, DraculaTheme.Cyan);
-            StyleButton(btnSaveOutput, DraculaTheme.Cyan);
-            StyleButton(btnClearOutput, DraculaTheme.Red);
-            chkSyntaxHighlighting.ForeColor = DraculaTheme.Foreground;
-            chkSyntaxHighlighting.BackColor = Color.Transparent;
-
-            // Splitter + status bar
-            splitContainerMain.BackColor = DraculaTheme.Comment;
-            statusStrip1.BackColor = DraculaTheme.CurrentLine;
-            toolStripStatusLabel1.ForeColor = DraculaTheme.Foreground;
-        }
-
-        private void StyleButton(Button btn, Color accent)
-        {
-            btn.FlatStyle = FlatStyle.Flat;
-            btn.BackColor = DraculaTheme.CurrentLine;
-            btn.ForeColor = DraculaTheme.Foreground;
-            btn.FlatAppearance.BorderColor = accent;
-            btn.FlatAppearance.BorderSize = 1;
-            btn.FlatAppearance.MouseOverBackColor = ControlPaint.Light(DraculaTheme.CurrentLine, 0.2f);
-            btn.FlatAppearance.MouseDownBackColor = accent;
-        }
-
         // ---------- Path selection ----------
 
         private void btnBrowseFolder_Click(object sender, EventArgs e)
@@ -308,15 +187,7 @@ namespace FileContentExporter
             _rootPath = path;
             _gitIgnore = GitIgnoreFilter.LoadFrom(path);
 
-            Cursor = Cursors.WaitCursor;
-            try
-            {
-                PopulateTree(path);
-            }
-            finally
-            {
-                Cursor = Cursors.Default;
-            }
+            using (WaitScope.Begin(this, "Loading folder tree…")) PopulateTree(path);
 
             RefreshExtensionChecklist();
             RememberRecentPath(path);
@@ -334,17 +205,6 @@ namespace FileContentExporter
                     node.Checked = true;
                 RestoreCheckedState(node.Nodes, relativePaths);
             }
-        }
-        private void SetupFindShortcut()
-        {
-            txtOutput.KeyDown += (s, e) =>
-            {
-                if (e.Control && e.KeyCode == Keys.F)
-                {
-                    e.SuppressKeyPress = true;
-                    ShowFindBox();
-                }
-            };
         }
         private void ShowFindBox()
         {
@@ -368,51 +228,30 @@ namespace FileContentExporter
                 _lastFindIndex = 0;
             }
         }
-        // Called from SetupRecentPathsAndFilter() at startup — see below.
-        private void CreateExtensionChecklist()
-        {
-            clbExtensions = new CheckedListBox
-            {
-                Dock = DockStyle.Bottom,
-                Height = 90,
-                CheckOnClick = true,
-                BackColor = DraculaTheme.Background,
-                ForeColor = DraculaTheme.Foreground,
-                BorderStyle = BorderStyle.FixedSingle
-            };
-            clbExtensions.ItemCheck += (s, e) =>
-            {
-                // ItemCheck fires before the change is applied — defer the rebuild.
-                BeginInvoke((Action)(() =>
-                {
-                    _excludedExtensions = clbExtensions.CheckedItems.Cast<string>()
-                        .Select(x => true).Any() // placeholder guard, real logic below
-                        ? _excludedExtensions : _excludedExtensions;
-
-                    _excludedExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    for (int i = 0; i < clbExtensions.Items.Count; i++)
-                        if (!clbExtensions.GetItemChecked(i))
-                            _excludedExtensions.Add((string)clbExtensions.Items[i]);
-
-                    if (!string.IsNullOrEmpty(_rootPath))
-                    {
-                        Cursor = Cursors.WaitCursor;
-                        try { PopulateTree(_rootPath); }
-                        finally { Cursor = Cursors.Default; }
-                    }
-                }));
-            };
-            splitContainerMain.Panel1.Controls.Add(clbExtensions);
-        }
-
         private void RefreshExtensionChecklist()
         {
             var extensions = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
             CollectExtensions(treeViewFiles.Nodes, extensions);
 
-            clbExtensions.Items.Clear();
-            foreach (var ext in extensions)
-                clbExtensions.Items.Add(string.IsNullOrEmpty(ext) ? "(none)" : ext, !_excludedExtensions.Contains(ext));
+            // Hidden extensions have no files left in the tree; keep them listed or they could never be re-enabled.
+            foreach (var ext in _excludedExtensions)
+                extensions.Add(ext);
+
+            _isRefreshingExtensions = true;
+            clbExtensions.BeginUpdate();
+            try
+            {
+                clbExtensions.Items.Clear();
+                foreach (var ext in extensions)
+                    clbExtensions.Items.Add(string.IsNullOrEmpty(ext) ? "(none)" : ext, !_excludedExtensions.Contains(ext));
+            }
+            finally
+            {
+                clbExtensions.EndUpdate();
+                _isRefreshingExtensions = false;
+            }
+
+            UpdateExtensionsTip();
         }
 
         private void CollectExtensions(TreeNodeCollection nodes, SortedSet<string> result)
@@ -581,60 +420,70 @@ namespace FileContentExporter
                 return;
             }
 
-            var files = new List<(string RelativePath, string Code, SyntaxHighlighter.Language Lang)>();
-            long totalChars = 0;
-
-            foreach (var node in fileNodes)
-            {
-                var info = (FileSystemNodeInfo)node.Tag;
-                string code = ReadFileSafely(info.FullPath);
-                totalChars += code.Length;
-                files.Add((GetRelativePath(info.FullPath), code, SyntaxHighlighter.GetLanguage(Path.GetExtension(info.FullPath))));
-            }
-
-            bool applyHighlight = chkSyntaxHighlighting.Checked && totalChars <= MaxHighlightChars;
-            Font regularFont = txtOutput.Font;
-            Font boldFont = new Font(regularFont, FontStyle.Bold);
-
+            bool applyHighlight = false;
             string finalTextForCountsOnly = string.Empty;
-            txtOutput.Clear();
-            SendMessage(txtOutput.Handle, WM_SETREDRAW, false, IntPtr.Zero);
-            try
+
+            using (var wait = WaitScope.Begin(this, "Reading files…"))
             {
-                foreach (var f in files)
+                var files = new List<(string RelativePath, string Code, SyntaxHighlighter.Language Lang)>();
+                long totalChars = 0;
+
+                for (int i = 0; i < fileNodes.Count; i++)
                 {
-                    // Header — bold, cyan
-                    txtOutput.SelectionStart = txtOutput.TextLength;
-                    txtOutput.SelectionLength = 0;
-                    txtOutput.SelectionColor = DraculaTheme.Cyan;
-                    txtOutput.SelectionFont = boldFont;
-                    txtOutput.AppendText("`" + f.RelativePath + ":`\n");
+                    wait.Update($"Reading files ({i + 1} of {fileNodes.Count})…");
 
-                    // Body — highlighted or plain, always via append (offsets never drift)
-                    if (applyHighlight)
-                        SyntaxHighlighter.AppendHighlighted(txtOutput, f.Code, f.Lang, DraculaTheme.Foreground, regularFont);
-                    else
-                    {
-                        txtOutput.SelectionStart = txtOutput.TextLength;
-                        txtOutput.SelectionLength = 0;
-                        txtOutput.SelectionColor = DraculaTheme.Foreground;
-                        txtOutput.SelectionFont = regularFont;
-                        txtOutput.AppendText(f.Code);
-                    }
-
-                    txtOutput.SelectionStart = txtOutput.TextLength;
-                    txtOutput.SelectionLength = 0;
-                    txtOutput.SelectionColor = DraculaTheme.Foreground;
-                    txtOutput.SelectionFont = regularFont;
-                    txtOutput.AppendText("\n\n");
+                    var info = (FileSystemNodeInfo)fileNodes[i].Tag;
+                    string code = ReadFileSafely(info.FullPath);
+                    totalChars += code.Length;
+                    files.Add((GetRelativePath(info.FullPath), code, SyntaxHighlighter.GetLanguage(Path.GetExtension(info.FullPath))));
                 }
-                finalTextForCountsOnly = txtOutput.Text;
-                txtOutput.Select(0, 0);
-            }
-            finally
-            {
-                SendMessage(txtOutput.Handle, WM_SETREDRAW, true, IntPtr.Zero);
-                txtOutput.Invalidate();
+
+                applyHighlight = chkSyntaxHighlighting.Checked && totalChars <= MaxHighlightChars;
+                wait.Update(applyHighlight ? "Highlighting syntax…" : "Building output…");
+
+                Font regularFont = txtOutput.Font;
+                using (Font boldFont = new Font(regularFont, FontStyle.Bold))
+                {
+                    txtOutput.Clear();
+                    SendMessage(txtOutput.Handle, WM_SETREDRAW, false, IntPtr.Zero);
+                    try
+                    {
+                        foreach (var f in files)
+                        {
+                            // Header — bold, cyan
+                            txtOutput.SelectionStart = txtOutput.TextLength;
+                            txtOutput.SelectionLength = 0;
+                            txtOutput.SelectionColor = DraculaTheme.Cyan;
+                            txtOutput.SelectionFont = boldFont;
+                            txtOutput.AppendText("`" + f.RelativePath + ":`\n");
+
+                            // Body — highlighted or plain, always via append (offsets never drift)
+                            if (applyHighlight)
+                                SyntaxHighlighter.AppendHighlighted(txtOutput, f.Code, f.Lang, DraculaTheme.Foreground, regularFont);
+                            else
+                            {
+                                txtOutput.SelectionStart = txtOutput.TextLength;
+                                txtOutput.SelectionLength = 0;
+                                txtOutput.SelectionColor = DraculaTheme.Foreground;
+                                txtOutput.SelectionFont = regularFont;
+                                txtOutput.AppendText(f.Code);
+                            }
+
+                            txtOutput.SelectionStart = txtOutput.TextLength;
+                            txtOutput.SelectionLength = 0;
+                            txtOutput.SelectionColor = DraculaTheme.Foreground;
+                            txtOutput.SelectionFont = regularFont;
+                            txtOutput.AppendText("\n\n");
+                        }
+                        finalTextForCountsOnly = txtOutput.Text;
+                        txtOutput.Select(0, 0);
+                    }
+                    finally
+                    {
+                        SendMessage(txtOutput.Handle, WM_SETREDRAW, true, IntPtr.Zero);
+                        txtOutput.Invalidate();
+                    }
+                }
             }
 
             int lineCount = txtOutput.Lines.Length;
@@ -743,6 +592,9 @@ namespace FileContentExporter
             toolStripStatusLabel1.Text = string.IsNullOrEmpty(_rootPath)
                 ? "No folder loaded."
                 : $"Root: {_rootPath}    |    Checked files: {fileCount}";
+            toolTipMainAppScreen.SetToolTip(btnGenerate, fileCount == 0
+                ? "Tick one or more files in the tree first."
+                : $"Build the export from {fileCount} checked file(s).");
         }
 
         private int CountCheckedFiles(TreeNodeCollection nodes)
@@ -756,6 +608,184 @@ namespace FileContentExporter
                 count += CountCheckedFiles(node.Nodes);
             }
             return count;
+        }
+        private void cmbRecentPaths_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            if (_isSyncingRecentPaths) return;
+
+            UpdateRecentPathsTip();
+            if (cmbRecentPaths.SelectedItem == null) return;
+
+            txtPath.Text = cmbRecentPaths.SelectedItem.ToString();
+            btnLoadTree_Click(sender, EventArgs.Empty);
+        }
+
+        private void txtFilter_Enter(object sender, EventArgs e)
+        {
+            if (txtFilter.Text == "*.cs;*.xaml")
+            {
+                txtFilter.Text = "";
+                txtFilter.ForeColor = DraculaTheme.Foreground;
+            }
+        }
+
+        private void txtFilter_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.KeyCode != Keys.Enter) return;
+            e.SuppressKeyPress = true;
+            ApplyFilterAndReload();
+        }
+
+        private void clbExtensions_ItemCheck(object sender, ItemCheckEventArgs e)
+        {
+            // Items.Add(text, true) raises this event too; those are not user clicks.
+            if (_isRefreshingExtensions) return;
+
+            // ItemCheck fires before the change is applied — defer the rebuild.
+            BeginInvoke((Action)(() =>
+            {
+                _excludedExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                for (int i = 0; i < clbExtensions.Items.Count; i++)
+                {
+                    if (clbExtensions.GetItemChecked(i)) continue;
+                    string ext = (string)clbExtensions.Items[i];
+                    _excludedExtensions.Add(ext == "(none)" ? string.Empty : ext);
+                }
+
+                UpdateExtensionsTip();
+                ReloadTree("Updating file list…");
+            }));
+        }
+
+        private void txtOutput_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Control && e.KeyCode == Keys.F)
+            {
+                e.SuppressKeyPress = true;
+                ShowFindBox();
+            }
+        }
+
+        private void frmFileExporter_DragEnter(object sender, DragEventArgs e)
+        {
+            e.Effect = e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None;
+        }
+
+        private void frmFileExporter_DragDrop(object sender, DragEventArgs e)
+        {
+            var paths = (string[])e.Data.GetData(DataFormats.FileDrop);
+            if (paths == null || paths.Length == 0) return;
+
+            string dropped = paths[0];
+            txtPath.Text = File.Exists(dropped) ? Path.GetDirectoryName(dropped) : dropped;
+            btnLoadTree_Click(sender, EventArgs.Empty);
+        }
+        // ---------- Dynamic tooltips ----------
+
+        // Rebuilds the tree while showing the wait card, and re-ticks whatever was ticked before.
+        private void ReloadTree(string message)
+        {
+            if (string.IsNullOrEmpty(_rootPath)) return;
+
+            var ticked = GetCheckedRelativePaths();   // PopulateTree throws every node away
+            using (WaitScope.Begin(this, message))
+                PopulateTree(_rootPath);
+
+            RestoreCheckedState(treeViewFiles.Nodes, ticked);
+            UpdateStatus();
+        }
+
+        private List<string> GetCheckedRelativePaths()
+        {
+            var fileNodes = new List<TreeNode>();
+            CollectCheckedFileNodes(treeViewFiles.Nodes, fileNodes);
+            return fileNodes.Select(n => GetRelativePath(((FileSystemNodeInfo)n.Tag).FullPath)).ToList();
+        }
+
+        private void UpdateRecentPathsTip()
+        {
+            string tip;
+            if (cmbRecentPaths.SelectedItem != null)
+                tip = cmbRecentPaths.SelectedItem + Environment.NewLine + "Pick another recent folder to reload the tree.";
+            else if (cmbRecentPaths.Items.Count == 0)
+                tip = "Recent folders appear here after you load one.";
+            else
+                tip = cmbRecentPaths.Items.Count + " recent folder(s) - pick one to load it.";
+
+            toolTipMainAppScreen.SetToolTip(cmbRecentPaths, tip);
+        }
+
+        private void UpdateFilterTip()
+        {
+            toolTipMainAppScreen.SetToolTip(txtFilter, _filterPatterns.Count == 0
+                ? "No filter - every file is listed." + Environment.NewLine + "Type patterns such as *.cs;*.xaml and press Enter."
+                : "Showing only: " + string.Join(", ", _filterPatterns.Select(p => p.Trim())) +
+                  Environment.NewLine + "Clear the box and press Enter to list everything.");
+        }
+
+        private void UpdateExtensionsTip()
+        {
+            string tip;
+            if (clbExtensions.Items.Count == 0)
+            {
+                tip = "File extensions found in the loaded folder appear here." + Environment.NewLine +
+                      "Untick one to hide those files.";
+            }
+            else
+            {
+                var hidden = new List<string>();
+                for (int i = 0; i < clbExtensions.Items.Count; i++)
+                    if (!clbExtensions.GetItemChecked(i))
+                        hidden.Add((string)clbExtensions.Items[i]);
+
+                tip = $"{clbExtensions.Items.Count - hidden.Count} of {clbExtensions.Items.Count} extensions shown.";
+                if (hidden.Count > 0)
+                    tip += Environment.NewLine + "Hidden: " + string.Join(", ", hidden.Take(8)) +
+                           (hidden.Count > 8 ? $" (+{hidden.Count - 8} more)" : "");
+                tip += Environment.NewLine + "Untick an extension to hide those files.";
+            }
+
+            toolTipMainAppScreen.SetToolTip(clbExtensions, tip);
+        }
+
+        private void chkExcludeCommon_CheckedChanged(object sender, EventArgs e)
+        {
+            toolTipMainAppScreen.SetToolTip(chkExcludeCommon, chkExcludeCommon.Checked
+                ? "ON - bin, obj, .git, .vs, node_modules, packages and .idea are hidden." + Environment.NewLine + "Click to show them."
+                : "OFF - every folder is listed, including build and VCS output." + Environment.NewLine + "Click to hide them.");
+
+            if (string.IsNullOrEmpty(_rootPath)) return;
+            ReloadTree("Updating folder list…");
+            RefreshExtensionChecklist();
+        }
+
+        private void chkSyntaxHighlighting_CheckedChanged(object sender, EventArgs e)
+        {
+            toolTipMainAppScreen.SetToolTip(chkSyntaxHighlighting, chkSyntaxHighlighting.Checked
+                ? $"ON - colors the output. Skipped automatically above {MaxHighlightChars:N0} characters." +
+                  Environment.NewLine + "Applies the next time you click Generate."
+                : "OFF - plain text output (fastest)." + Environment.NewLine + "Applies the next time you click Generate.");
+        }
+
+        // Dracula-styled tooltip: measure, then paint.
+        private void toolTipMainAppScreen_Popup(object sender, PopupEventArgs e)
+        {
+            string text = toolTipMainAppScreen.GetToolTip(e.AssociatedControl) ?? string.Empty;
+            Size size = TextRenderer.MeasureText(text, TipFont, new Size(360, 0), TipFlags);
+            e.ToolTipSize = new Size(size.Width + 20, size.Height + 14);
+        }
+
+        private void toolTipMainAppScreen_Draw(object sender, DrawToolTipEventArgs e)
+        {
+            using (var back = new SolidBrush(DraculaTheme.CurrentLine))
+            using (var border = new Pen(DraculaTheme.Purple))
+            {
+                e.Graphics.FillRectangle(back, e.Bounds);
+                e.Graphics.DrawRectangle(border, 0, 0, e.Bounds.Width - 1, e.Bounds.Height - 1);
+            }
+
+            var textBounds = new Rectangle(10, 7, e.Bounds.Width - 20, e.Bounds.Height - 14);
+            TextRenderer.DrawText(e.Graphics, e.ToolTipText, TipFont, textBounds, DraculaTheme.Foreground, TipFlags);
         }
     }
     #region Helper Classes
